@@ -4,26 +4,20 @@ import {
   YSweetProvider,
   YSweetProviderParams,
   createYjsProvider,
-  debuggerUrl,
+  EVENT_LOCAL_CHANGES,
+  EVENT_CONNECTION_STATUS,
 } from '@y-sweet/client'
-import type { AuthEndpoint, YSweetProviderWithClientToken } from '@y-sweet/client'
+import type { AuthEndpoint, YSweetStatus } from '@y-sweet/client'
 import type { ClientToken } from '@y-sweet/sdk'
 import type { ReactNode } from 'react'
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react'
 import type { Awareness } from 'y-protocols/awareness'
 import * as Y from 'yjs'
-export {
-  createYjsProvider,
-  YSweetProvider,
-  debuggerUrl,
-  type YSweetProviderParams,
-  type YSweetProviderWithClientToken,
-  type AuthEndpoint,
-}
+export { createYjsProvider, YSweetProvider, type YSweetProviderParams, type AuthEndpoint }
 
 type YjsContextType = {
   doc: Y.Doc
-  provider: YSweetProviderWithClientToken
+  provider: YSweetProvider
 }
 
 const YjsContext = createContext<YjsContextType | null>(null)
@@ -65,7 +59,8 @@ export function useYSweetDebugUrl(): string {
   if (!yjsCtx) {
     throw new Error('Yjs hooks must be used within a YDocProvider')
   }
-  return debuggerUrl(yjsCtx.provider.clientToken)
+
+  return yjsCtx.provider.debugUrl || ''
 }
 
 /**
@@ -82,6 +77,50 @@ export function useYjsProvider(): YSweetProvider {
     throw new Error('Yjs hooks must be used within a YDocProvider')
   }
   return yjsCtx.provider
+}
+
+/** Returns true if the local document has unsaved changes. */
+export function useHasLocalChanges(): boolean {
+  const yjsCtx = useContext(YjsContext)
+  if (!yjsCtx) {
+    throw new Error('Yjs hooks must be used within a YDocProvider')
+  }
+
+  const [isSynced, setIsSynced] = useState(yjsCtx.provider.hasLocalChanges)
+
+  useEffect(() => {
+    const handleSync = () => {
+      setIsSynced(yjsCtx.provider.hasLocalChanges)
+    }
+    yjsCtx.provider.on(EVENT_LOCAL_CHANGES, handleSync)
+    return () => {
+      yjsCtx.provider.off(EVENT_LOCAL_CHANGES, handleSync)
+    }
+  }, [yjsCtx.provider])
+
+  return isSynced
+}
+
+/** Returns the current connection status of the Yjs provider. */
+export function useConnectionStatus(): YSweetStatus {
+  const yjsCtx = useContext(YjsContext)
+  if (!yjsCtx) {
+    throw new Error('Yjs hooks must be used within a YDocProvider')
+  }
+
+  const [status, setStatus] = useState(yjsCtx.provider.status)
+
+  useEffect(() => {
+    const handleStatus = (status: YSweetStatus) => {
+      setStatus(status)
+    }
+    yjsCtx.provider.on(EVENT_CONNECTION_STATUS, handleStatus)
+    return () => {
+      yjsCtx.provider.off(EVENT_CONNECTION_STATUS, handleStatus)
+    }
+  }, [yjsCtx.provider])
+
+  return status
 }
 
 /**
@@ -181,8 +220,16 @@ export type YDocProviderProps = {
    * will be set to the doc id provided. */
   setQueryParam?: string
 
-  /** Whether to hide the debugger link. Defaults to true. */
+  /** Whether to show the debugger link. Defaults to true. */
   showDebuggerLink?: boolean
+
+  /**
+   * Whether to enable offline support. Document state will be stored on the client side for offline use
+   * and faster startup times.
+   *
+   * Defaults to `true`.
+   */
+  offlineSupport?: boolean
 }
 
 /**
@@ -194,41 +241,17 @@ export function YDocProvider(props: YDocProviderProps) {
   const [ctx, setCtx] = useState<YjsContextType | null>(null)
 
   useEffect(() => {
-    let canceled = false
-    let provider: YSweetProviderWithClientToken | null = null
     const doc = new Y.Doc()
+    const provider = createYjsProvider(doc, docId, authEndpoint, {
+      initialClientToken,
+      offlineSupport: props.offlineSupport,
+      showDebuggerLink: props.showDebuggerLink,
+    })
 
-    ;(async () => {
-      provider = await createYjsProvider(doc, docId, authEndpoint, {
-        initialClientToken,
-        // TODO: this disables local cross-tab communication, which makes
-        // debugging easier, but should be re-enabled eventually
-        disableBc: true,
-      })
-
-      if (props.showDebuggerLink ?? true) {
-        const url = debuggerUrl(provider.clientToken)
-        console.log(
-          `%cOpen this in Y-Sweet Debugger ⮕ ${url}`,
-          'font-size: 1.5em; display: block; padding: 10px;',
-        )
-        console.log(
-          '%cTo hide the debugger link, pass showDebuggerLink={false} to YDocProvider',
-          'font-style: italic;',
-        )
-      }
-
-      if (canceled) {
-        provider.destroy()
-        return
-      }
-
-      setCtx({ doc, provider })
-    })()
+    setCtx({ doc, provider })
 
     return () => {
-      canceled = true
-      provider?.destroy()
+      provider.destroy()
       doc.destroy()
     }
   }, [docId])

@@ -1,18 +1,18 @@
 {
   "name": "y-sweet",
   "bin": {
-    "y-sweet": "./src/run.js"
+    "y-sweet": "src/run.js"
   },
   "scripts": {
     "postinstall": "node src/install.js",
     "format": "prettier --write \"**/*.{ts,tsx,js,jsx}\""
   },
-  "version": "0.6.0",
+  "version": "0.8.1",
   "description": "npm wrapper for y-sweet server",
   "homepage": "https://github.com/drifting-in-space/y-sweet",
   "repository": {
     "type": "git",
-    "url": "https://github.com/drifting-in-space/y-sweet.git"
+    "url": "git+https://github.com/drifting-in-space/y-sweet.git"
   },
   "license": "MIT",
   "devDependencies": {

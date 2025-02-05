@@ -7,7 +7,7 @@
     "format": "prettier --write \"**/*.{ts,tsx,js,jsx}\"",
     "prepublishOnly": "npm run build"
   },
-  "version": "0.6.0",
+  "version": "0.8.1",
   "description": "React library for building collaboration features with y-sweet.",
   "main": "./dist/main.js",
   "types": "./dist/main.d.ts",
@@ -30,7 +30,7 @@
   "homepage": "https://github.com/drifting-in-space/y-sweet",
   "repository": {
     "type": "git",
-    "url": "https://github.com/drifting-in-space/y-sweet.git"
+    "url": "git+https://github.com/drifting-in-space/y-sweet.git"
   },
   "license": "MIT",
   "devDependencies": {
@@ -43,12 +43,12 @@
     "url": "https://github.com/drifting-in-space/y-sweet/issues"
   },
   "peerDependencies": {
-    "react": "^16.8.0 || ^17.0.0 || ^18.0.0",
-    "yjs": "^13.0.0"
+    "react": "^16.8 || ^17 || ^18 || ^19 || ^19.0.0-rc",
+    "yjs": "^13"
   },
   "dependencies": {
-    "@y-sweet/client": "0.6.0",
-    "@y-sweet/sdk": "0.6.0",
+    "@y-sweet/client": "0.8.1",
+    "@y-sweet/sdk": "0.8.1",
     "y-protocols": "^1.0.5"
   }
 }

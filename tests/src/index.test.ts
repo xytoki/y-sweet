@@ -8,7 +8,7 @@ import {
 import { WebSocket } from 'ws'
 import * as Y from 'yjs'
 import { Server, ServerConfiguration } from './server'
-import { waitForProviderSync } from './util'
+import { waitForProviderSync, waitForProviderSyncChanges } from './util'
 
 /**
  * Wraps `createYjsProvider` with a polyfill for `WebSocket` and
@@ -23,20 +23,12 @@ function createYjsProvider(
 ) {
   extraOptions = {
     WebSocketPolyfill: require('ws'),
-    // Broadcast channel prevents us from mocking separate clients.
-    disableBc: true,
     ...extraOptions,
   }
   return createYjsProvider_(doc, docId, authEndpoint, extraOptions)
 }
 
-const CONFIGURATIONS: ServerConfiguration[] = [
-  { useAuth: false, server: 'native' },
-  { useAuth: true, server: 'native' },
-  // TODO: figure out why these fail on CI/CD even though they work locally.
-  // { useAuth: false, server: 'worker' },
-  // { useAuth: true, server: 'worker' },
-]
+const CONFIGURATIONS: ServerConfiguration[] = [{ useAuth: false }, { useAuth: true }]
 
 let S3_ACCESS_KEY_ID = process.env.Y_SWEET_S3_ACCESS_KEY_ID
 let S3_SECRET_KEY = process.env.Y_SWEET_S3_SECRET_KEY
@@ -47,7 +39,6 @@ let S3_BUCKET_NAME = process.env.Y_SWEET_S3_BUCKET_NAME
 if (S3_ACCESS_KEY_ID && S3_REGION && S3_SECRET_KEY && S3_BUCKET_PREFIX && S3_BUCKET_NAME) {
   CONFIGURATIONS.push({
     useAuth: true,
-    server: 'native',
     s3: {
       bucket_name: S3_BUCKET_NAME,
       bucket_prefix: S3_BUCKET_PREFIX,
@@ -58,27 +49,10 @@ if (S3_ACCESS_KEY_ID && S3_REGION && S3_SECRET_KEY && S3_BUCKET_PREFIX && S3_BUC
   })
 }
 
-let MINIO_PORT = process.env.Y_SWEET_MINIO_PORT
-//run s3 tests using minio if available
-if (MINIO_PORT && S3_BUCKET_NAME && S3_BUCKET_PREFIX) {
-  CONFIGURATIONS.push({
-    useAuth: true,
-    server: 'worker',
-    s3: {
-      bucket_name: S3_BUCKET_NAME,
-      bucket_prefix: S3_BUCKET_PREFIX,
-      endpoint: `http://localhost:${MINIO_PORT}`,
-      aws_access_key_id: 'minioadmin',
-      aws_region: 'minio',
-      aws_secret_key: 'minioadmin',
-    },
-  })
-}
-
 const TEN_MINUTES_IN_MS = 10 * 60 * 1_000
 
 describe.each(CONFIGURATIONS)(
-  'Test $server (auth: $useAuth, s3: $s3)',
+  'Test (auth: $useAuth, s3: $s3)',
   (configuration: ServerConfiguration) => {
     let SERVER: Server
     let DOCUMENT_MANANGER: DocumentManager
@@ -136,12 +110,9 @@ describe.each(CONFIGURATIONS)(
       const getClientToken = async () => await DOCUMENT_MANANGER.getClientToken(docResult)
 
       const doc = new Y.Doc()
-      const provider = await createYjsProvider(doc, docResult.docId, getClientToken, {})
+      const provider = createYjsProvider(doc, docResult.docId, getClientToken, {})
 
-      await new Promise((resolve, reject) => {
-        provider.on('synced', resolve)
-        provider.on('syncing', reject)
-      })
+      await waitForProviderSync(provider)
     })
 
     test('Update doc and fetch as update', async () => {
@@ -171,7 +142,7 @@ describe.each(CONFIGURATIONS)(
       const getClientToken = async () => await DOCUMENT_MANANGER.getClientToken(docResult)
 
       const doc = new Y.Doc()
-      const provider = await createYjsProvider(doc, docResult.docId, getClientToken, {})
+      const provider = createYjsProvider(doc, docResult.docId, getClientToken, {})
 
       let map = doc.getMap('test')
       map.set('foo', 'bar')
@@ -205,7 +176,7 @@ describe.each(CONFIGURATIONS)(
 
       const getClientToken = async () => await DOCUMENT_MANANGER.getClientToken(docResult)
 
-      const provider = await createYjsProvider(doc, docResult.docId, getClientToken, {})
+      const provider = createYjsProvider(doc, docResult.docId, getClientToken, {})
       await waitForProviderSync(provider)
 
       let newMap = doc.getMap('abc123')
@@ -229,37 +200,10 @@ describe.each(CONFIGURATIONS)(
       const doc = new Y.Doc()
 
       // Connect to the doc.
-      const provider = await createYjsProvider(doc, docResult.docId, getClientToken, {})
-
-      await waitForProviderSync(provider)
-
-      // Disconnect.
-      expect(provider.ws).not.toBeNull()
-      provider.ws!.close()
-
-      await new Promise<void>((resolve, reject) => {
-        setTimeout(() => reject('Expected to disconnect.'), 1_000)
-        provider.on('connection-close', () => {
-          resolve()
-        })
-      })
-
-      expect(provider.synced).toBe(false)
+      const provider = createYjsProvider(doc, docResult.docId, getClientToken, {})
 
       // Modify the doc while offline.
       doc.getMap('test').set('foo', 'bar')
-
-      // Reconnect to the doc.
-      provider.connect()
-      await new Promise<void>((resolve, reject) => {
-        provider.on('status', (event: { status: string }) => {
-          if (event.status === 'connected') {
-            resolve()
-          } else {
-            reject(`Expected connected status, got ${event.status}`)
-          }
-        })
-      })
 
       await waitForProviderSync(provider)
       expect(provider.synced).toBe(true)
@@ -268,7 +212,7 @@ describe.each(CONFIGURATIONS)(
       const doc2 = new Y.Doc()
 
       // Connect to the doc.
-      const provider2 = await createYjsProvider(doc2, docResult.docId, getClientToken, {})
+      const provider2 = createYjsProvider(doc2, docResult.docId, getClientToken, {})
 
       expect(doc2.getMap('test').get('foo')).toBeUndefined()
 
@@ -279,7 +223,118 @@ describe.each(CONFIGURATIONS)(
       expect(doc2.getMap('test').get('foo')).toBe('bar')
     })
 
+    test('Create doc with initial content', async () => {
+      const doc = new Y.Doc()
+      const map = doc.getMap('test')
+      map.set('initial', 'content')
+
+      const update = Y.encodeStateAsUpdate(doc)
+      const docResult = await DOCUMENT_MANANGER.createDocWithContent(update)
+
+      // Verify the doc was created
+      expect(typeof docResult.docId).toBe('string')
+
+      // Connect to the doc and verify the content
+      const getClientToken = async () => await DOCUMENT_MANANGER.getClientToken(docResult)
+      const newDoc = new Y.Doc()
+      const provider = createYjsProvider(newDoc, docResult.docId, getClientToken, {})
+
+      await waitForProviderSync(provider)
+
+      const newMap = newDoc.getMap('test')
+      expect(newMap.get('initial')).toBe('content')
+    })
+
     if (configuration.useAuth) {
+      test('Attempting to connect to a document without auth should fail', async () => {
+        const docResult = await DOCUMENT_MANANGER.createDoc()
+        const key = await DOCUMENT_MANANGER.getClientToken(docResult)
+
+        expect(key.token).toBeDefined()
+        delete key.token
+
+        let ws = new WebSocket(`${key.url}/${key.docId}`)
+        let result = new Promise<void>((resolve, reject) => {
+          ws.addEventListener('open', () => {
+            resolve()
+          })
+          ws.addEventListener('error', (e) => {
+            reject(e.message)
+          })
+        })
+
+        await expect(result).rejects.toContain('401')
+      })
+
+      test('Attempting to update a document with read-only authorization should fail', async () => {
+        const { docId } = await DOCUMENT_MANANGER.createDoc()
+        const clientToken = await DOCUMENT_MANANGER.getClientToken(docId, { authorization: 'full' })
+        const readOnlyClientToken = await DOCUMENT_MANANGER.getClientToken(docId, {
+          authorization: 'read-only',
+        })
+
+        const doc1 = new Y.Doc()
+        const provider = createYjsProvider(doc1, docId, async () => clientToken, {})
+        await waitForProviderSync(provider)
+
+        doc1.getMap('test').set('foo', 'bar')
+        await waitForProviderSyncChanges(provider)
+
+        const doc2 = new Y.Doc()
+        doc2.getMap('test').set('foo', 'qux')
+
+        const headers = new Headers()
+        headers.set('Authorization', `Bearer ${readOnlyClientToken.token}`)
+        headers.set('Content-Type', 'application/octet-stream')
+        const url = `${readOnlyClientToken.baseUrl}/update`
+        const result = await fetch(url, {
+          method: 'POST',
+          body: Y.encodeStateAsUpdate(doc2),
+          headers,
+        })
+        expect(result.ok).toBe(false)
+
+        // expect there to be no update
+        await new Promise((res, rej) => {
+          doc1.once('update', () => rej('Expected update event to not fire'))
+          setTimeout(res, 1000)
+        })
+
+        expect(doc1.getMap('test').get('foo')).toBe('bar') // doc1 should not be updated
+      })
+
+      test('Attempting to write to a document over websocket with read-only authorization should fail', async () => {
+        const { docId } = await DOCUMENT_MANANGER.createDoc()
+        const clientToken = await DOCUMENT_MANANGER.getClientToken(docId, { authorization: 'full' })
+        const readOnlyClientToken = await DOCUMENT_MANANGER.getClientToken(docId, {
+          authorization: 'read-only',
+        })
+
+        const doc1 = new Y.Doc()
+        const provider = createYjsProvider(doc1, docId, async () => clientToken, {})
+        await waitForProviderSync(provider)
+
+        doc1.getMap('test').set('foo', 'bar')
+        await waitForProviderSyncChanges(provider)
+
+        const doc2 = new Y.Doc()
+        const provider2 = createYjsProvider(doc2, docId, async () => readOnlyClientToken, {})
+        await waitForProviderSync(provider2)
+        expect(doc2.getMap('test').get('foo')).toBe('bar')
+
+        // Attempt to write to the doc.
+        doc2.getMap('test').set('foo', 'qux')
+        await waitForProviderSyncChanges(provider2)
+
+        // expect there to be no update
+        await new Promise((res, rej) => {
+          doc1.once('update', () => rej('Expected update event to not fire'))
+          setTimeout(res, 1000)
+        })
+
+        expect(doc1.getMap('test').get('foo')).toBe('bar') // doc1 should not be updated
+      })
+
       test('Connecting with 0 validForSeconds should fail', async () => {
         const docResult = await DOCUMENT_MANANGER.createDoc()
         const conn = await DOCUMENT_MANANGER.getDocConnection(docResult, { validForSeconds: 0 })
@@ -320,48 +375,6 @@ describe.each(CONFIGURATIONS)(
           }
         }
       }, 10_000)
-
-      test('Attempting to connect to a document without auth should fail', async () => {
-        const docResult = await DOCUMENT_MANANGER.createDoc()
-        const key = await DOCUMENT_MANANGER.getClientToken(docResult)
-
-        expect(key.token).toBeDefined()
-        delete key.token
-
-        let ws = new WebSocket(`${key.url}/${key.docId}`)
-        let result = new Promise<void>((resolve, reject) => {
-          ws.addEventListener('open', () => {
-            resolve()
-          })
-          ws.addEventListener('error', (e) => {
-            reject(e.message)
-          })
-        })
-
-        await expect(result).rejects.toContain('401')
-      })
     }
-
-    test('Create doc with initial content', async () => {
-      const doc = new Y.Doc()
-      const map = doc.getMap('test')
-      map.set('initial', 'content')
-
-      const update = Y.encodeStateAsUpdate(doc)
-      const docResult = await DOCUMENT_MANANGER.createDocWithContent(update)
-
-      // Verify the doc was created
-      expect(typeof docResult.docId).toBe('string')
-
-      // Connect to the doc and verify the content
-      const getClientToken = async () => await DOCUMENT_MANANGER.getClientToken(docResult)
-      const newDoc = new Y.Doc()
-      const provider = await createYjsProvider(newDoc, docResult.docId, getClientToken, {})
-
-      await waitForProviderSync(provider)
-
-      const newMap = newDoc.getMap('test')
-      expect(newMap.get('initial')).toBe('content')
-    })
   },
 )

@@ -54,7 +54,10 @@ function Nav({ curRoute, onClickLink }: { curRoute: string; onClickLink?: () => 
               Slate Text Editor
             </NavLink>
             <NavLink href="/code-editor" curRoute={curRoute}>
-              Code Editor
+              CodeMirror Editor
+            </NavLink>
+            <NavLink href="/monaco" curRoute={curRoute}>
+              Monaco Editor
             </NavLink>
             <NavLink href="/tree-crdt" curRoute={curRoute}>
               Tree CRDT
@@ -62,11 +65,8 @@ function Nav({ curRoute, onClickLink }: { curRoute: string; onClickLink?: () => 
             <NavLink href="/voxels" curRoute={curRoute}>
               Voxel Draw
             </NavLink>
-            <NavLink href="/tldraw" curRoute={curRoute}>
-              tldraw
-            </NavLink>
-            <NavLink href="/presence" curRoute={curRoute}>
-              Live Cursors
+            <NavLink href="/blocknote" curRoute={curRoute}>
+              BlockNote
             </NavLink>
           </ul>
           <h3 className="px-6 text-xs tracking-wide text-pink-100 mt-6 mb-2">LEARN</h3>

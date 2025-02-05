@@ -1,207 +1,69 @@
-/**
- * Adapted from y-websocket
- *
- * https://raw.githubusercontent.com/yjs/y-websocket/master/src/y-websocket.js
- */
-
-import * as Y from 'yjs' // eslint-disable-line
-import type { ClientToken } from '@y-sweet/sdk'
-import * as bc from 'lib0/broadcastchannel'
-import * as time from 'lib0/time'
-import * as encoding from 'lib0/encoding'
+import { encodeClientToken, type ClientToken } from '@y-sweet/sdk'
 import * as decoding from 'lib0/decoding'
-import * as syncProtocol from 'y-protocols/sync'
-import * as authProtocol from 'y-protocols/auth'
+import * as encoding from 'lib0/encoding'
 import * as awarenessProtocol from 'y-protocols/awareness'
-import { Observable } from 'lib0/observable'
-import * as math from 'lib0/math'
-import * as url from 'lib0/url'
+import * as syncProtocol from 'y-protocols/sync'
+import * as Y from 'yjs'
+import { Sleeper } from './sleeper'
+import {
+  EVENT_CONNECTION_CLOSE,
+  EVENT_CONNECTION_ERROR,
+  WebSocketCompatLayer,
+  YWebsocketEvent,
+} from './ws-status'
+import { createIndexedDBProvider, IndexedDBProvider } from './indexeddb'
 
-export const messageSync = 0
-export const messageQueryAwareness = 3
-export const messageAwareness = 1
-export const messageAuth = 2
+const MESSAGE_SYNC = 0
+const MESSAGE_QUERY_AWARENESS = 3
+const MESSAGE_AWARENESS = 1
+const MESSAGE_SYNC_STATUS = 102
 
-export type HandlerFunction = (
-  encoder: encoding.Encoder,
-  decoder: decoding.Decoder,
-  provider: YSweetProvider,
-  emitSynced: boolean,
-  messageType: number,
-) => void
+const RETRIES_BEFORE_TOKEN_REFRESH = 3
+const DELAY_MS_BEFORE_RECONNECT = 500
+const DELAY_MS_BEFORE_RETRY_TOKEN_REFRESH = 3_000
 
-const messageHandlers: Array<HandlerFunction> = []
+const BACKOFF_BASE = 1.1
+const MAX_BACKOFF_COEFFICIENT = 10
 
-messageHandlers[messageSync] = (encoder, decoder, provider, emitSynced, _messageType) => {
-  encoding.writeVarUint(encoder, messageSync)
-  const syncMessageType = syncProtocol.readSyncMessage(decoder, encoder, provider.doc, provider)
-  if (emitSynced && syncMessageType === syncProtocol.messageYjsSyncStep2 && !provider.synced) {
-    provider.synced = true
-  }
-}
+/** Amount of time without receiving any message that we should send a MESSAGE_SYNC_STATUS message. */
+const MAX_TIMEOUT_BETWEEN_HEARTBEATS = 2_000
 
-messageHandlers[messageQueryAwareness] = (
-  encoder,
-  _decoder,
-  provider,
-  _emitSynced,
-  _messageType,
-) => {
-  encoding.writeVarUint(encoder, messageAwareness)
-  encoding.writeVarUint8Array(
-    encoder,
-    awarenessProtocol.encodeAwarenessUpdate(
-      provider.awareness,
-      Array.from(provider.awareness.getStates().keys()),
-    ),
-  )
-}
+/**
+ * Amount of time after sending a MESSAGE_SYNC_STATUS message that we should close the connection
+ * unless any message has been received.
+ **/
+const MAX_TIMEOUT_WITHOUT_RECEIVING_HEARTBEAT = 3_000
 
-messageHandlers[messageAwareness] = (_encoder, decoder, provider, _emitSynced, _messageType) => {
-  awarenessProtocol.applyAwarenessUpdate(
-    provider.awareness,
-    decoding.readVarUint8Array(decoder),
-    provider,
-  )
-}
+// Note: These should not conflict with y-websocket's events, defined in `ws-status.ts`.
+export const EVENT_LOCAL_CHANGES = 'local-changes'
+export const EVENT_CONNECTION_STATUS = 'connection-status'
 
-messageHandlers[messageAuth] = (_encoder, decoder, provider, _emitSynced, _messageType) => {
-  authProtocol.readAuthMessage(decoder, provider.doc, (_ydoc, reason) =>
-    permissionDeniedHandler(provider, reason),
-  )
-}
+type YSweetEvent = typeof EVENT_LOCAL_CHANGES | typeof EVENT_CONNECTION_STATUS
 
-// @todo - this should depend on awareness.outdatedTime
-const messageReconnectTimeout = 30000
+/** The provider is offline because it has not been asked to connect or has been disconnected by the application. */
+export const STATUS_OFFLINE = 'offline'
 
-// the number of times we try to reconnect before recreating the provider
-const recreateThreshold = 5
+/** The provider is attempting to connect. */
+export const STATUS_CONNECTING = 'connecting'
 
-const permissionDeniedHandler = (provider: YSweetProvider, reason: string) =>
-  console.warn(`Permission denied to access ${provider.url}.\n${reason}`)
+/** The provider is in an error state and will attempt to reconnect after a delay. */
+export const STATUS_ERROR = 'error'
 
-const readMessage = (
-  provider: YSweetProvider,
-  buf: Uint8Array,
-  emitSynced: boolean,
-): encoding.Encoder => {
-  const decoder = decoding.createDecoder(buf)
-  const encoder = encoding.createEncoder()
-  const messageType = decoding.readVarUint(decoder)
-  const messageHandler = provider.messageHandlers[messageType]
-  if (/** @type {any} */ messageHandler) {
-    messageHandler(encoder, decoder, provider, emitSynced, messageType)
-  } else {
-    console.error('Unable to compute message')
-  }
-  return encoder
-}
+/** The provider is connected but has not yet completed the handshake. */
+export const STATUS_HANDSHAKING = 'handshaking'
 
-const setupWS = (provider: YSweetProvider) => {
-  if (provider.shouldConnect && provider.ws === null) {
-    const websocket = new provider._WS(provider.url)
-    websocket.binaryType = 'arraybuffer'
-    provider.ws = websocket
-    provider.wsconnecting = true
-    provider.wsconnected = false
-    provider.synced = false
+/** The provider is connected and has completed the handshake. */
+export const STATUS_CONNECTED = 'connected'
 
-    websocket.onmessage = (event) => {
-      provider.wsLastMessageReceived = time.getUnixTime()
-      const encoder = readMessage(provider, new Uint8Array(event.data), true)
-      if (encoding.length(encoder) > 1) {
-        websocket.send(encoding.toUint8Array(encoder))
-      }
-    }
-    websocket.onerror = (event) => {
-      provider.emit('connection-error', [event, provider])
-    }
-    websocket.onclose = (event) => {
-      provider.emit('connection-close', [event, provider])
-      provider.ws = null
-      provider.wsconnecting = false
-      if (provider.wsconnected) {
-        provider.wsconnected = false
-        provider.synced = false
-        // update awareness (all users except local left)
-        awarenessProtocol.removeAwarenessStates(
-          provider.awareness,
-          Array.from(provider.awareness.getStates().keys()).filter(
-            (client) => client !== provider.doc.clientID,
-          ),
-          provider,
-        )
-        provider.emit('status', [
-          {
-            status: 'disconnected',
-          },
-        ])
-      } else {
-        provider.wsUnsuccessfulReconnects++
-      }
-
-      if (provider.wsUnsuccessfulReconnects > recreateThreshold) {
-        provider.destroy()
-        while (provider.onFailureHandlers.length > 0) {
-          provider.onFailureHandlers.pop()!()
-        }
-        return
-      }
-
-      // Start with no reconnect timeout and increase timeout by
-      // using exponential backoff starting with 100ms
-      setTimeout(
-        setupWS,
-        math.min(math.pow(2, provider.wsUnsuccessfulReconnects) * 100, provider.maxBackoffTime),
-        provider,
-      )
-    }
-    websocket.onopen = () => {
-      provider.wsLastMessageReceived = time.getUnixTime()
-      provider.wsconnecting = false
-      provider.wsconnected = true
-      provider.wsUnsuccessfulReconnects = 0
-      provider.emit('status', [
-        {
-          status: 'connected',
-        },
-      ])
-      // always send sync step 1 when connected
-      const encoder = encoding.createEncoder()
-      encoding.writeVarUint(encoder, messageSync)
-      syncProtocol.writeSyncStep1(encoder, provider.doc)
-      websocket.send(encoding.toUint8Array(encoder))
-      // broadcast local awareness state
-      if (provider.awareness.getLocalState() !== null) {
-        const encoderAwarenessState = encoding.createEncoder()
-        encoding.writeVarUint(encoderAwarenessState, messageAwareness)
-        encoding.writeVarUint8Array(
-          encoderAwarenessState,
-          awarenessProtocol.encodeAwarenessUpdate(provider.awareness, [provider.doc.clientID]),
-        )
-        websocket.send(encoding.toUint8Array(encoderAwarenessState))
-      }
-    }
-    provider.emit('status', [
-      {
-        status: 'connecting',
-      },
-    ])
-  }
-}
-
-const broadcastMessage = (provider: YSweetProvider, buf: ArrayBuffer) => {
-  const ws = provider.ws
-  if (provider.wsconnected && ws && ws.readyState === ws.OPEN) {
-    ws.send(buf)
-  }
-  if (provider.bcconnected) {
-    bc.publish(provider.bcChannel, buf, provider)
-  }
-}
+export type YSweetStatus =
+  | typeof STATUS_OFFLINE
+  | typeof STATUS_CONNECTED
+  | typeof STATUS_CONNECTING
+  | typeof STATUS_ERROR
+  | typeof STATUS_HANDSHAKING
 
 type WebSocketPolyfillType = {
-  new (url: string | URL, protocols?: string | string[] | undefined): WebSocket
+  new (url: string | URL): WebSocket
   prototype: WebSocket
   readonly CLOSED: number
   readonly CLOSING: number
@@ -210,443 +72,650 @@ type WebSocketPolyfillType = {
 }
 
 export type AuthEndpoint = string | (() => Promise<ClientToken>)
-export type YSweetProviderWithClientToken = YSweetProvider & {
-  clientToken: ClientToken
-}
 
 export type YSweetProviderParams = {
+  /** Whether to connect to the websocket on creation (otherwise use `connect()`) */
   connect?: boolean
+
+  /** Awareness protocol instance */
   awareness?: awarenessProtocol.Awareness
-  params?: {
-    [x: string]: string
-  }
+
+  /** WebSocket constructor to use (defaults to `WebSocket`) */
   WebSocketPolyfill?: WebSocketPolyfillType
-  resyncInterval?: number
-  maxBackoffTime?: number
-  disableBc?: boolean
+
+  /** An initial client token to use (skips the first auth request if provided.) */
   initialClientToken?: ClientToken
+
+  /**
+   * If set, document state is stored locally for offline use and faster re-opens.
+   * Defaults to `false`; set to `true` to enable.
+   */
+  offlineSupport?: boolean
+
+  /** Whether to show the debugger link. Defaults to true. */
+  showDebuggerLink?: boolean
 }
 
-/**
- * Websocket Provider for Yjs. Creates a websocket connection to sync the shared document.
- * The document name is attached to the provided url. I.e. the following example
- * creates a websocket connection to http://localhost:1234/my-document-name
- *
- * @example
- * import * as Y from 'yjs'
- * import { YSweetProvider } from 'y-websocket'
- * const doc = new Y.Doc()
- * const provider = new YSweetProvider('http://localhost:1234', 'my-document-name', doc)
- */
-export class YSweetProvider extends Observable<string> {
-  onFailureHandlers: Array<() => void> = []
-  maxBackoffTime: number
-  bcChannel: string
-  url: string
-  roomname: string
-  doc: Y.Doc
-  _WS: WebSocketPolyfillType
-  awareness: awarenessProtocol.Awareness
-  wsconnected: boolean
-  wsconnecting: boolean
-  bcconnected: boolean
-  disableBc: boolean
-  wsUnsuccessfulReconnects: number
-  messageHandlers: Array<HandlerFunction>
-  _synced: boolean
-  ws: WebSocket | null
-  wsLastMessageReceived: number
-  shouldConnect: boolean
-  _resyncInterval: ReturnType<typeof setInterval> | number // TODO: is setting this to 0 used as null?
-  _bcSubscriber: Function
-  _updateHandler: (arg0: Uint8Array, arg1: any, arg2: Y.Doc, arg3: Y.Transaction) => void
-  _awarenessUpdateHandler: Function
-  _unloadHandler: Function
-  _checkInterval: ReturnType<typeof setInterval> | number
-
-  /**
-   * @param serverUrl - server url
-   * @param roomname - room name
-   * @param doc - Y.Doc instance
-   * @param opts - options
-   * @param opts.connect - connect option
-   * @param opts.awareness - awareness protocol instance
-   * @param opts.params - parameters
-   * @param opts.WebSocketPolyfill - WebSocket polyfill
-   * @param opts.resyncInterval - resync interval
-   * @param opts.maxBackoffTime - maximum backoff time
-   * @param opts.disableBc - disable broadcast channel
-   */
-  constructor(
-    serverUrl: string,
-    roomname: string,
-    doc: Y.Doc,
-    {
-      connect = true,
-      awareness = new awarenessProtocol.Awareness(doc),
-      params = {},
-      WebSocketPolyfill = WebSocket,
-      resyncInterval = -1,
-      maxBackoffTime = 2500,
-      disableBc = false,
-    }: YSweetProviderParams = {},
-  ) {
-    super()
-    // ensure that url is always ends with /
-    while (serverUrl[serverUrl.length - 1] === '/') {
-      serverUrl = serverUrl.slice(0, serverUrl.length - 1)
-    }
-    const encodedParams = url.encodeQueryParams(params)
-    this.maxBackoffTime = maxBackoffTime
-    this.bcChannel = serverUrl + '/' + roomname
-    this.url = serverUrl + '/' + roomname + (encodedParams.length === 0 ? '' : '?' + encodedParams)
-    this.roomname = roomname
-    this.doc = doc
-    this._WS = WebSocketPolyfill
-    this.awareness = awareness
-    this.wsconnected = false
-    this.wsconnecting = false
-    this.bcconnected = false
-    this.disableBc = disableBc
-    this.wsUnsuccessfulReconnects = 0
-    this.messageHandlers = messageHandlers.slice()
-    this._synced = false
-    this.ws = null
-    this.wsLastMessageReceived = 0
-    this.shouldConnect = connect
-
-    this._resyncInterval = 0
-    if (resyncInterval > 0) {
-      this._resyncInterval = setInterval(() => {
-        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-          // resend sync step 1
-          const encoder = encoding.createEncoder()
-          encoding.writeVarUint(encoder, messageSync)
-          syncProtocol.writeSyncStep1(encoder, doc)
-          this.ws.send(encoding.toUint8Array(encoder))
-        }
-      }, resyncInterval)
-    }
-
-    this._bcSubscriber = (data: ArrayBuffer, origin: any) => {
-      if (origin !== this) {
-        const encoder = readMessage(this, new Uint8Array(data), false)
-        if (encoding.length(encoder) > 1) {
-          bc.publish(this.bcChannel, encoding.toUint8Array(encoder), this)
-        }
-      }
-    }
-
-    /**
-     * Listens to Yjs updates and sends them to remote peers (ws and broadcastchannel)
-     */
-    this._updateHandler = (update: Uint8Array, origin: any) => {
-      if (origin !== this) {
-        const encoder = encoding.createEncoder()
-        encoding.writeVarUint(encoder, messageSync)
-        syncProtocol.writeUpdate(encoder, update)
-        broadcastMessage(this, encoding.toUint8Array(encoder))
-      }
-    }
-
-    this.doc.on('update', this._updateHandler as any)
-
-    // TODO: I think we can get more specific with the array types.
-    // They are not documented here so we need to do some digging.
-    // https://docs.yjs.dev/api/about-awareness
-    this._awarenessUpdateHandler = (
-      { added, updated, removed }: { added: Array<any>; updated: Array<any>; removed: Array<any> },
-      _origin: any,
-    ) => {
-      const changedClients = added.concat(updated).concat(removed)
-      const encoder = encoding.createEncoder()
-      encoding.writeVarUint(encoder, messageAwareness)
-      encoding.writeVarUint8Array(
-        encoder,
-        awarenessProtocol.encodeAwarenessUpdate(awareness, changedClients),
-      )
-      broadcastMessage(this, encoding.toUint8Array(encoder))
-    }
-
-    this._unloadHandler = () => {
-      awarenessProtocol.removeAwarenessStates(this.awareness, [doc.clientID], 'window unload')
-    }
-
-    if (typeof window !== 'undefined') {
-      window.addEventListener('unload', this._unloadHandler as any)
-    } else if (typeof process !== 'undefined') {
-      process.on('exit', this._unloadHandler as any)
-    }
-
-    awareness.on('update', this._awarenessUpdateHandler)
-    this._checkInterval = setInterval(() => {
-      if (
-        this.wsconnected &&
-        messageReconnectTimeout < time.getUnixTime() - this.wsLastMessageReceived
-      ) {
-        // no message received in a long time - not even your own awareness
-        // updates (which are updated every 15 seconds)
-        this.ws?.close()
-      }
-    }, messageReconnectTimeout / 10)
-    if (connect) {
-      this.connect()
-    }
-  }
-
-  /**
-   * @type {boolean}
-   */
-  get synced() {
-    return this._synced
-  }
-
-  set synced(state) {
-    if (this._synced !== state) {
-      this._synced = state
-      this.emit('synced', [state])
-      this.emit('sync', [state])
-    }
-  }
-
-  destroy() {
-    if (this._resyncInterval !== 0) {
-      clearInterval(this._resyncInterval)
-    }
-    clearInterval(this._checkInterval)
-    this.disconnect()
-    if (typeof window !== 'undefined') {
-      window.removeEventListener('unload', this._unloadHandler as any)
-    } else if (typeof process !== 'undefined') {
-      process.off('exit', this._unloadHandler as any)
-    }
-    this.awareness.off('update', this._awarenessUpdateHandler)
-    this.doc.off('update', this._updateHandler)
-    super.destroy()
-  }
-
-  connectBc() {
-    if (this.disableBc) {
-      return
-    }
-    if (!this.bcconnected) {
-      bc.subscribe(this.bcChannel, this._bcSubscriber as any)
-      this.bcconnected = true
-    }
-    // send sync step1 to bc
-    // write sync step 1
-    const encoderSync = encoding.createEncoder()
-    encoding.writeVarUint(encoderSync, messageSync)
-    syncProtocol.writeSyncStep1(encoderSync, this.doc)
-    bc.publish(this.bcChannel, encoding.toUint8Array(encoderSync), this)
-    // broadcast local state
-    const encoderState = encoding.createEncoder()
-    encoding.writeVarUint(encoderState, messageSync)
-    syncProtocol.writeSyncStep2(encoderState, this.doc)
-    bc.publish(this.bcChannel, encoding.toUint8Array(encoderState), this)
-    // write queryAwareness
-    const encoderAwarenessQuery = encoding.createEncoder()
-    encoding.writeVarUint(encoderAwarenessQuery, messageQueryAwareness)
-    bc.publish(this.bcChannel, encoding.toUint8Array(encoderAwarenessQuery), this)
-    // broadcast local awareness state
-    const encoderAwarenessState = encoding.createEncoder()
-    encoding.writeVarUint(encoderAwarenessState, messageAwareness)
-    encoding.writeVarUint8Array(
-      encoderAwarenessState,
-      awarenessProtocol.encodeAwarenessUpdate(this.awareness, [this.doc.clientID]),
+function validateClientToken(clientToken: ClientToken, docId: string) {
+  if (clientToken.docId !== docId) {
+    throw new Error(
+      `ClientToken docId does not match YSweetProvider docId: ${clientToken.docId} !== ${docId}`,
     )
-    bc.publish(this.bcChannel, encoding.toUint8Array(encoderAwarenessState), this)
-  }
-
-  disconnectBc() {
-    // broadcast message with local awareness state set to null (indicating disconnect)
-    const encoder = encoding.createEncoder()
-    encoding.writeVarUint(encoder, messageAwareness)
-    encoding.writeVarUint8Array(
-      encoder,
-      awarenessProtocol.encodeAwarenessUpdate(this.awareness, [this.doc.clientID], new Map()),
-    )
-    broadcastMessage(this, encoding.toUint8Array(encoder))
-    if (this.bcconnected) {
-      bc.unsubscribe(this.bcChannel, this._bcSubscriber as any)
-      this.bcconnected = false
-    }
-  }
-
-  disconnect() {
-    this.shouldConnect = false
-    this.disconnectBc()
-    if (this.ws !== null) {
-      this.ws.close()
-    }
-  }
-
-  connect() {
-    this.shouldConnect = true
-    if (!this.wsconnected && this.ws === null) {
-      setupWS(this)
-      this.connectBc()
-    }
-  }
-
-  addOnFailureHandler(handler: () => void): () => void {
-    this.onFailureHandlers.push(handler)
-    return () => {
-      this.onFailureHandlers = this.onFailureHandlers.filter((h) => h !== handler)
-    }
   }
 }
 
-async function getClientToken(authEndpoint: AuthEndpoint, roomname: string): Promise<ClientToken> {
+async function getClientToken(authEndpoint: AuthEndpoint, docId: string): Promise<ClientToken> {
   if (typeof authEndpoint === 'function') {
-    return await authEndpoint()
+    const clientToken = await authEndpoint()
+    validateClientToken(clientToken, docId)
+    return clientToken
   }
-  const body = JSON.stringify({ docId: roomname })
+
+  const body = JSON.stringify({ docId: docId })
   const res = await fetch(authEndpoint, {
     method: 'POST',
     body,
     headers: { 'Content-Type': 'application/json' },
   })
-  // TODO: handle errors
+
+  if (!res.ok) {
+    throw new Error(`Failed to get client token: ${res.status} ${res.statusText}`)
+  }
+
   const clientToken = await res.json()
-  // TODO: check that clientToken.docId === this.roomname
+  validateClientToken(clientToken, docId)
+
   return clientToken
 }
 
-function updateProviderParams(
-  providerParams: YSweetProviderParams,
-  clientToken: ClientToken,
-): YSweetProviderParams {
-  // if the clientToken has a token, add it to the provider params
-  const connectParams = providerParams.params ? { ...providerParams.params } : {}
-  if (clientToken.token) connectParams.token = clientToken.token
-  return { ...providerParams, params: connectParams }
-}
+export class YSweetProvider {
+  /** Awareness protocol instance. */
+  public awareness: awarenessProtocol.Awareness
 
-export async function ySweetProviderWrapper(
-  authEndpoint: AuthEndpoint,
-  roomname: string,
-  doc: Y.Doc,
-  wrapperParams: YSweetProviderParams = {},
-): Promise<YSweetProviderWithClientToken> {
-  let { initialClientToken, ...providerParams } = wrapperParams
+  /** Current client token. */
+  public clientToken: ClientToken | null = null
 
-  // we use an observable that lives outside the provider to store event listeners
-  // so that we can re-subscribe to events when the provider is re-created
-  const observable = new Observable<string>()
-  // keep track of which events have been subscribed to on the local observable
-  // so we can re-subscribe to them when the provider is re-created
-  const subscribedEvents = new Set<string>()
+  /** Connection status. */
+  public status: YSweetStatus = STATUS_OFFLINE
 
-  const awareness = providerParams.awareness ?? new awarenessProtocol.Awareness(doc)
-  providerParams = { ...providerParams, awareness }
+  private websocket: WebSocket | null = null
+  private WebSocketPolyfill: WebSocketPolyfillType
+  private listeners: Map<YSweetEvent | YWebsocketEvent, Set<EventListener>> = new Map()
 
-  let _clientToken = initialClientToken ?? (await getClientToken(authEndpoint, roomname))
-  let _provider = new YSweetProvider(_clientToken.url, roomname, doc, {
-    ...updateProviderParams(providerParams, _clientToken),
-  })
-  _provider.addOnFailureHandler(recreateProvider)
+  private localVersion: number = 0
+  private ackedVersion: number = -1
 
-  async function recreateProvider() {
-    _clientToken = await getClientToken(authEndpoint, roomname)
-    _provider = new YSweetProvider(_clientToken.url, roomname, doc, {
-      ...updateProviderParams(providerParams, _clientToken),
-      connect: true,
-    })
-    _provider.addOnFailureHandler(recreateProvider)
-    // the previous provider's destroy() method should have been called before
-    // recreateProvider() is called, so we don't need to unsubscribe from events
-    // before re-subscribing to events here
-    for (const event of subscribedEvents) {
-      subscribeToEvent(event)
+  /** Whether we are currently in the process of connecting. */
+  private isConnecting: boolean = false
+
+  private heartbeatHandle: ReturnType<typeof setTimeout> | null = null
+  private connectionTimeoutHandle: ReturnType<typeof setTimeout> | null = null
+
+  private reconnectSleeper: Sleeper | null = null
+  private showDebuggerLink = true
+
+  private indexedDBProvider: IndexedDBProvider | null = null
+
+  private retries: number = 0
+
+  /**
+   * Older versions of the Y-Sweet server did not support the sync message, and would ignore it.
+   * This may lead to the client thinking the server is offline, when really it just doesn't
+   * know how to return a heartbeat.
+   *
+   * Eventually, we will build protocol version negotiation into the handshake. Until then, we
+   * use a simple approach: until we receive the first sync message back, we assume the server
+   * is an older version for the purpose of the heartbeat logic.
+   */
+  private receivedAtLeastOneSyncResponse: boolean = false
+
+  /** @deprecated */
+  get debugUrl() {
+    if (!this.clientToken) return null
+
+    const payload = encodeClientToken(this.clientToken)
+    return `https://debugger.y-sweet.dev/?payload=${payload}`
+  }
+
+  constructor(
+    private authEndpoint: AuthEndpoint,
+    private docId: string,
+    private doc: Y.Doc,
+    extraOptions: Partial<YSweetProviderParams> = {},
+  ) {
+    if (extraOptions.initialClientToken) {
+      this.clientToken = extraOptions.initialClientToken
+      validateClientToken(this.clientToken, this.docId)
+    }
+
+    this.showDebuggerLink = extraOptions.showDebuggerLink !== false
+
+    // Sets up some event handlers for y-websocket compatibility.
+    new WebSocketCompatLayer(this)
+
+    this.awareness = extraOptions.awareness ?? new awarenessProtocol.Awareness(doc)
+    this.awareness.on('update', this.handleAwarenessUpdate.bind(this))
+    this.WebSocketPolyfill = extraOptions.WebSocketPolyfill || WebSocket
+
+    this.online = this.online.bind(this)
+    this.offline = this.offline.bind(this)
+    if (typeof window !== 'undefined') {
+      window.addEventListener('offline', this.offline)
+      window.addEventListener('online', this.online)
+    }
+
+    if (extraOptions.offlineSupport === true && typeof indexedDB !== 'undefined') {
+      ;(async () => {
+        this.indexedDBProvider = await createIndexedDBProvider(doc, docId)
+      })()
+    }
+
+    doc.on('update', this.update.bind(this))
+
+    if (extraOptions.connect !== false) {
+      this.connect()
     }
   }
 
-  // for each event that is subscribed to on the local observable, make sure to
-  // subscribe to it on the provider
-  function subscribeToEvent(name: string) {
-    _provider.on(name, (...args: any[]) => observable.emit(name, args))
-    subscribedEvents.add(name)
+  private offline() {
+    // When the browser indicates that we are offline, we immediately
+    // probe the connection status.
+    // This accelerates the process of discovering we are offline, but
+    // doesn't mean we entirely trust the browser, since it can be wrong
+    // (e.g. in the case that the connection is over localhost).
+    this.checkSync()
   }
 
-  return {
-    on: (name: string, f: (...args: any[]) => void) => {
-      if (!subscribedEvents.has(name)) subscribeToEvent(name)
-      observable.on(name, f)
-    },
-    once: (name: string, f: (...args: any[]) => void) => {
-      if (!subscribedEvents.has(name)) subscribeToEvent(name)
-      observable.once(name, f)
-    },
-    off: (name: string, f: (...args: any[]) => void) => {
-      observable.off(name, f)
-    },
-    awareness,
-    get clientToken() {
-      return _clientToken
-    },
-    destroy() {
-      _provider.destroy()
-    },
-    connectBc() {
-      _provider.connectBc()
-    },
-    disconnectBc() {
-      _provider.disconnectBc()
-    },
-    disconnect() {
-      _provider.disconnect()
-    },
-    connect() {
-      _provider.connect()
-    },
-    addOnFailureHandler(handler: () => void): () => void {
-      return _provider.addOnFailureHandler(handler)
-    },
-    get synced() {
-      return _provider.synced
-    },
-    get maxBackoffTime() {
-      return _provider.maxBackoffTime
-    },
-    get bcChannel() {
-      return _provider.bcChannel
-    },
-    get url() {
-      return _provider.url
-    },
-    get roomname() {
-      return _provider.roomname
-    },
-    get doc() {
-      return _provider.doc
-    },
-    get wsconnected() {
-      return _provider.wsconnected
-    },
-    get wsconnecting() {
-      return _provider.wsconnecting
-    },
-    get bcconnected() {
-      return _provider.bcconnected
-    },
-    get disableBc() {
-      return _provider.disableBc
-    },
-    get wsUnsuccessfulReconnects() {
-      return _provider.wsUnsuccessfulReconnects
-    },
-    get messageHandlers() {
-      return _provider.messageHandlers
-    },
-    get ws() {
-      return _provider.ws
-    },
-    get wsLastMessageReceived() {
-      return _provider.wsLastMessageReceived
-    },
-    get shouldConnect() {
-      return _provider.shouldConnect
-    },
-  } as unknown as YSweetProviderWithClientToken
+  private online() {
+    if (this.reconnectSleeper) {
+      this.reconnectSleeper.wake()
+    }
+  }
+
+  private clearHeartbeat() {
+    if (this.heartbeatHandle) {
+      clearTimeout(this.heartbeatHandle)
+      this.heartbeatHandle = null
+    }
+  }
+
+  private resetHeartbeat() {
+    this.clearHeartbeat()
+    this.heartbeatHandle = setTimeout(() => {
+      this.checkSync()
+      this.heartbeatHandle = null
+    }, MAX_TIMEOUT_BETWEEN_HEARTBEATS)
+  }
+
+  private clearConnectionTimeout() {
+    if (this.connectionTimeoutHandle) {
+      clearTimeout(this.connectionTimeoutHandle)
+      this.connectionTimeoutHandle = null
+    }
+  }
+
+  private setConnectionTimeout() {
+    if (this.connectionTimeoutHandle) {
+      return
+    }
+
+    if (!this.receivedAtLeastOneSyncResponse) {
+      // Until we receive the first sync response on the connection, we assume
+      // the server is an older version.
+      return
+    }
+
+    this.connectionTimeoutHandle = setTimeout(() => {
+      if (this.websocket) {
+        this.websocket.close()
+        this.setStatus(STATUS_ERROR)
+        this.connect()
+      }
+      this.connectionTimeoutHandle = null
+    }, MAX_TIMEOUT_WITHOUT_RECEIVING_HEARTBEAT)
+  }
+
+  private send(message: Uint8Array) {
+    if (this.websocket?.readyState === this.WebSocketPolyfill.OPEN) {
+      this.websocket.send(message)
+    }
+  }
+
+  private incrementLocalVersion() {
+    // We need to increment the local version before we emit, so that event
+    // listeners see the right hasLocalChanges value.
+    let emit = !this.hasLocalChanges
+    this.localVersion += 1
+
+    if (emit) {
+      this.emit(EVENT_LOCAL_CHANGES, true)
+    }
+  }
+
+  private updateAckedVersion(version: number) {
+    // The version _should_ never go backwards, but we guard for that in case it does.
+    version = Math.max(version, this.ackedVersion)
+
+    // We need to increment the local version before we emit, so that event
+    // listeners see the right hasLocalChanges value.
+    let emit = this.hasLocalChanges && version === this.localVersion
+    this.ackedVersion = version
+
+    if (emit) {
+      this.emit(EVENT_LOCAL_CHANGES, false)
+    }
+
+    this.receivedAtLeastOneSyncResponse = true
+  }
+
+  private setStatus(status: YSweetStatus) {
+    if (this.status === status) {
+      return
+    }
+
+    this.status = status
+    this.emit(EVENT_CONNECTION_STATUS, status)
+  }
+
+  private update(update: Uint8Array, origin: YSweetProvider | IndexedDBProvider) {
+    if (origin === this) {
+      // Ignore updates that came through the Y-Sweet Provider (i.e. not local changes)
+      return
+    }
+
+    if (this.indexedDBProvider && origin === this.indexedDBProvider) {
+      // Ignore updates from our own IndexedDB provider.
+      return
+    }
+
+    // If we made it here, the update came from local changes.
+    // Warn if the client holds a read-only token.
+    const authorization = this.clientToken?.authorization
+    if (authorization === 'read-only') {
+      console.warn(
+        'Client with read-only authorization attempted to write to the Yjs document. These changes may appear locally, but they will not be applied to the shared document.',
+      )
+    }
+
+    const encoder = encoding.createEncoder()
+    encoding.writeVarUint(encoder, MESSAGE_SYNC)
+    syncProtocol.writeUpdate(encoder, update)
+    this.send(encoding.toUint8Array(encoder))
+
+    this.incrementLocalVersion()
+    this.checkSync()
+  }
+
+  private checkSync() {
+    const encoder = encoding.createEncoder()
+    encoding.writeVarUint(encoder, MESSAGE_SYNC_STATUS)
+
+    const versionEncoder = encoding.createEncoder()
+    encoding.writeVarUint(versionEncoder, this.localVersion)
+    encoding.writeVarUint8Array(encoder, encoding.toUint8Array(versionEncoder))
+
+    this.send(encoding.toUint8Array(encoder))
+    this.setConnectionTimeout()
+  }
+
+  private async ensureClientToken(): Promise<ClientToken> {
+    if (this.clientToken === null) {
+      this.clientToken = await getClientToken(this.authEndpoint, this.docId)
+    }
+    return this.clientToken
+  }
+
+  /**
+   * Attempts to connect to the websocket.
+   * Returns a promise that resolves to true if the connection was successful, or false if the connection failed.
+   */
+  private attemptToConnect(clientToken: ClientToken): Promise<boolean> {
+    let promise = new Promise<boolean>((resolve) => {
+      let statusListener = (event: YSweetStatus) => {
+        if (event === STATUS_CONNECTED) {
+          this.off(EVENT_CONNECTION_STATUS, statusListener)
+          resolve(true)
+        } else if (event === STATUS_ERROR) {
+          this.off(EVENT_CONNECTION_STATUS, statusListener)
+          resolve(false)
+        }
+      }
+
+      this.on(EVENT_CONNECTION_STATUS, statusListener)
+    })
+
+    let url = this.generateUrl(clientToken)
+    this.setStatus(STATUS_CONNECTING)
+    const websocket = new (this.WebSocketPolyfill || WebSocket)(url)
+    this.bindWebsocket(websocket)
+
+    return promise
+  }
+
+  public async connect(): Promise<void> {
+    if (this.isConnecting) {
+      console.warn('connect() called while a connect loop is already running.')
+      return
+    }
+
+    this.isConnecting = true
+    this.setStatus(STATUS_CONNECTING)
+
+    const lastDebugUrl = this.debugUrl
+
+    connecting: while (![STATUS_OFFLINE, STATUS_CONNECTED].includes(this.status)) {
+      this.setStatus(STATUS_CONNECTING)
+      let clientToken
+      try {
+        clientToken = await this.ensureClientToken()
+      } catch (e) {
+        console.warn('Failed to get client token', e)
+        this.setStatus(STATUS_ERROR)
+        let timeout =
+          DELAY_MS_BEFORE_RETRY_TOKEN_REFRESH *
+          Math.min(MAX_BACKOFF_COEFFICIENT, Math.pow(BACKOFF_BASE, this.retries))
+        this.retries += 1
+        this.reconnectSleeper = new Sleeper(timeout)
+        await this.reconnectSleeper.sleep()
+        continue
+      }
+
+      for (let i = 0; i < RETRIES_BEFORE_TOKEN_REFRESH; i++) {
+        if (await this.attemptToConnect(clientToken)) {
+          this.retries = 0
+          break connecting
+        }
+
+        let timeout =
+          DELAY_MS_BEFORE_RECONNECT *
+          Math.min(MAX_BACKOFF_COEFFICIENT, Math.pow(BACKOFF_BASE, this.retries))
+        this.retries += 1
+        this.reconnectSleeper = new Sleeper(timeout)
+        await this.reconnectSleeper.sleep()
+      }
+
+      // Delete the current client token to force a token refresh on the next attempt.
+      this.clientToken = null
+    }
+
+    this.isConnecting = false
+
+    if (this.showDebuggerLink && lastDebugUrl !== this.debugUrl) {
+      console.log(
+        `%cOpen this in Y-Sweet Debugger ⮕ ${this.debugUrl}`,
+        'font-size: 1.5em; display: block; padding: 10px;',
+      )
+      console.log(
+        '%cTo hide the debugger link, set the showDebuggerLink option to false when creating the provider',
+        'font-style: italic;',
+      )
+    }
+  }
+
+  public disconnect() {
+    if (this.websocket) {
+      this.websocket.close()
+    }
+
+    this.setStatus(STATUS_OFFLINE)
+  }
+
+  private bindWebsocket(websocket: WebSocket) {
+    if (this.websocket) {
+      this.websocket.close()
+      this.websocket.onopen = null
+      this.websocket.onmessage = null
+      this.websocket.onclose = null
+      this.websocket.onerror = null
+    }
+
+    this.websocket = websocket
+    this.websocket.binaryType = 'arraybuffer'
+    this.websocket.onopen = this.websocketOpen.bind(this)
+    this.websocket.onmessage = this.receiveMessage.bind(this)
+    this.websocket.onclose = this.websocketClose.bind(this)
+    this.websocket.onerror = this.websocketError.bind(this)
+  }
+
+  generateUrl(clientToken: ClientToken) {
+    const url = clientToken.url + `/${clientToken.docId}`
+    if (clientToken.token) {
+      return `${url}?token=${clientToken.token}`
+    }
+    return url
+  }
+
+  private syncStep1() {
+    const encoder = encoding.createEncoder()
+    encoding.writeVarUint(encoder, MESSAGE_SYNC)
+    syncProtocol.writeSyncStep1(encoder, this.doc)
+    this.send(encoding.toUint8Array(encoder))
+  }
+
+  private receiveSyncMessage(decoder: decoding.Decoder) {
+    const encoder = encoding.createEncoder()
+    encoding.writeVarUint(encoder, MESSAGE_SYNC)
+    const syncMessageType = syncProtocol.readSyncMessage(decoder, encoder, this.doc, this)
+    if (syncMessageType === syncProtocol.messageYjsSyncStep2) {
+      this.setStatus(STATUS_CONNECTED)
+    }
+
+    if (encoding.length(encoder) > 1) {
+      this.send(encoding.toUint8Array(encoder))
+    }
+  }
+
+  private queryAwareness() {
+    const encoder = encoding.createEncoder()
+    encoding.writeVarUint(encoder, MESSAGE_QUERY_AWARENESS)
+    encoding.writeVarUint8Array(
+      encoder,
+      awarenessProtocol.encodeAwarenessUpdate(
+        this.awareness,
+        Array.from(this.awareness.getStates().keys()),
+      ),
+    )
+
+    this.send(encoding.toUint8Array(encoder))
+  }
+
+  private broadcastAwareness() {
+    if (this.awareness.getLocalState() !== null) {
+      const encoderAwarenessState = encoding.createEncoder()
+      encoding.writeVarUint(encoderAwarenessState, MESSAGE_AWARENESS)
+      encoding.writeVarUint8Array(
+        encoderAwarenessState,
+        awarenessProtocol.encodeAwarenessUpdate(this.awareness, [this.doc.clientID]),
+      )
+      this.send(encoding.toUint8Array(encoderAwarenessState))
+    }
+  }
+
+  private updateAwareness(decoder: decoding.Decoder) {
+    awarenessProtocol.applyAwarenessUpdate(
+      this.awareness,
+      decoding.readVarUint8Array(decoder),
+      this,
+    )
+  }
+
+  private websocketOpen() {
+    this.setStatus(STATUS_HANDSHAKING)
+    this.syncStep1()
+    this.checkSync()
+    this.broadcastAwareness()
+    this.resetHeartbeat()
+
+    this.receivedAtLeastOneSyncResponse = false
+  }
+
+  private receiveMessage(event: MessageEvent) {
+    this.clearConnectionTimeout()
+    this.resetHeartbeat()
+
+    let message: Uint8Array = new Uint8Array(event.data)
+    const decoder = decoding.createDecoder(message)
+    const messageType = decoding.readVarUint(decoder)
+    switch (messageType) {
+      case MESSAGE_SYNC:
+        this.receiveSyncMessage(decoder)
+        break
+      case MESSAGE_AWARENESS:
+        this.updateAwareness(decoder)
+        break
+      case MESSAGE_QUERY_AWARENESS:
+        this.queryAwareness()
+        break
+      case MESSAGE_SYNC_STATUS:
+        let lastSyncBytes = decoding.readVarUint8Array(decoder)
+        let d2 = decoding.createDecoder(lastSyncBytes)
+        let ackedVersion = decoding.readVarUint(d2)
+        this.updateAckedVersion(ackedVersion)
+        break
+      default:
+        break
+    }
+  }
+
+  private websocketClose(event: CloseEvent) {
+    this.emit(EVENT_CONNECTION_CLOSE, event)
+    this.setStatus(STATUS_ERROR)
+    this.clearHeartbeat()
+    this.clearConnectionTimeout()
+    this.connect()
+
+    // Remove all awareness states except for our own.
+    awarenessProtocol.removeAwarenessStates(
+      this.awareness,
+      Array.from(this.awareness.getStates().keys()).filter(
+        (client) => client !== this.doc.clientID,
+      ),
+      this,
+    )
+  }
+
+  private websocketError(event: Event) {
+    this.emit(EVENT_CONNECTION_ERROR, event)
+    this.setStatus(STATUS_ERROR)
+    this.clearHeartbeat()
+    this.clearConnectionTimeout()
+
+    this.connect()
+  }
+
+  public emit(eventName: YSweetEvent | YWebsocketEvent, data: any = null): void {
+    const listeners = this.listeners.get(eventName) || new Set()
+    for (const listener of listeners) {
+      listener(data)
+    }
+  }
+
+  private handleAwarenessUpdate(
+    { added, updated, removed }: { added: Array<any>; updated: Array<any>; removed: Array<any> },
+    _origin: any,
+  ) {
+    const changedClients = added.concat(updated).concat(removed)
+    const encoder = encoding.createEncoder()
+    encoding.writeVarUint(encoder, MESSAGE_AWARENESS)
+    encoding.writeVarUint8Array(
+      encoder,
+      awarenessProtocol.encodeAwarenessUpdate(this.awareness, changedClients),
+    )
+
+    this.send(encoding.toUint8Array(encoder))
+  }
+
+  public destroy() {
+    if (this.websocket) {
+      this.websocket.close()
+    }
+
+    if (this.indexedDBProvider) {
+      this.indexedDBProvider.destroy()
+    }
+
+    awarenessProtocol.removeAwarenessStates(this.awareness, [this.doc.clientID], 'window unload')
+
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('offline', this.offline)
+      window.removeEventListener('online', this.online)
+    }
+  }
+
+  private _on(
+    type: YSweetEvent | YWebsocketEvent,
+    listener: (d: any) => void,
+    once?: boolean,
+  ): void {
+    if (!this.listeners.has(type)) {
+      this.listeners.set(type, new Set())
+    }
+    if (once) {
+      let listenerOnce = (d: any) => {
+        listener(d)
+        this.listeners.get(type)?.delete(listenerOnce)
+      }
+      this.listeners.get(type)?.add(listenerOnce)
+    } else {
+      this.listeners.get(type)?.add(listener)
+    }
+  }
+
+  public on(type: YSweetEvent | YWebsocketEvent, listener: (d: any) => void): void {
+    this._on(type, listener)
+  }
+
+  public once(type: YSweetEvent | YWebsocketEvent, listener: (d: any) => void): void {
+    this._on(type, listener, true)
+  }
+
+  public off(type: YSweetEvent | YWebsocketEvent, listener: (d: any) => void): void {
+    const listeners = this.listeners.get(type)
+    if (listeners) {
+      listeners.delete(listener)
+    }
+  }
+
+  /**
+   * Whether the document has local changes.
+   */
+  get hasLocalChanges() {
+    return this.ackedVersion !== this.localVersion
+  }
+
+  /**
+   * Whether the provider should attempt to connect.
+   *
+   * @deprecated use provider.status !== 'offline' instead, or call `provider.connect()` / `provider.disconnect()` to set.
+   */
+  get shouldConnect(): boolean {
+    return this.status !== STATUS_OFFLINE
+  }
+
+  /**
+   * Whether the underlying websocket is connected.
+   *
+   * @deprecated use provider.status === 'connected' || provider.status === 'handshaking' instead.
+   */
+  get wsconnected() {
+    return this.status === STATUS_CONNECTED || this.status === STATUS_HANDSHAKING
+  }
+
+  /**
+   * Whether the underlying websocket is connecting.
+   *
+   * @deprecated use provider.status === 'connecting' instead.
+   */
+  get wsconnecting() {
+    return this.status === STATUS_CONNECTING
+  }
+
+  /**
+   * Whether the document is synced. (For compatibility with y-websocket.)
+   *
+   * @deprecated use provider.status === 'connected' instead.
+   * */
+  get synced() {
+    return this.status === STATUS_CONNECTED
+  }
 }
